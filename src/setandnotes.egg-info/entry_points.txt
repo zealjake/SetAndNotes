@@ -1,0 +1,2 @@
+[console_scripts]
+setandnotes = setandnotes.app:main
