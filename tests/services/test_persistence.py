@@ -40,6 +40,26 @@ def test_save_and_load_library_round_trip(tmp_path: Path):
     assert target.exists()
 
 
+def test_save_and_load_library_round_trip_preserves_web_note_users(tmp_path: Path):
+    from setandnotes.services.persistence import load_library, save_library
+
+    library = build_library()
+    library.web_note_users = [
+        {"username": "CreativeDirector", "token": "tok-creative", "enabled": True},
+        {"username": "VideoDirector", "token": "tok-video", "enabled": False},
+    ]
+    target = tmp_path / "library.json"
+
+    save_library(library, target)
+
+    restored = load_library(target)
+
+    assert restored.web_note_users == [
+        {"username": "CreativeDirector", "token": "tok-creative", "enabled": True},
+        {"username": "VideoDirector", "token": "tok-video", "enabled": False},
+    ]
+
+
 def test_save_library_uses_atomic_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from setandnotes.services import persistence
 

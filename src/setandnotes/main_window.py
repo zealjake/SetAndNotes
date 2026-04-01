@@ -14,6 +14,15 @@ from setandnotes.services.persistence import load_library, save_library
 from setandnotes.services.reaper_marker_stream import ReaperMarkerStreamClient
 from setandnotes.services.reaper_notes import capture_note_timestamp, create_note_marker, fetch_marker_snapshot, group_notes_by_song
 from setandnotes.services.touchdesigner_render_import import import_rendered_video_folder
+from setandnotes.services.web_note_capture import WebNoteCaptureService
+from setandnotes.services.web_note_server import WebNoteServer
+from setandnotes.services.web_note_users import (
+    build_copy_all_web_note_links_text,
+    build_web_note_url,
+    create_web_note_user,
+    detect_web_note_host,
+    normalize_web_note_users,
+)
 from setandnotes.styles.fonts import activate_application_fonts
 from setandnotes.styles.theme import application_stylesheet
 from setandnotes.ui.export_dialog import ExportDialog
@@ -48,6 +57,8 @@ class SetAndNotesMainWindow(QMainWindow):
         create_note_marker_fn=create_note_marker,
         marker_snapshot_fn=fetch_marker_snapshot,
         marker_stream_factory: Callable[[Callable[[list[dict]], None], Callable[[str], None]], object] | None = None,
+        web_note_server_factory: Callable[[object], object] | None = None,
+        web_note_public_host: str | None = None,
         app_settings_path: Path | str | None = None,
         import_dialog_factory=ImportDialog,
         export_dialog_factory=ExportDialog,
@@ -68,6 +79,8 @@ class SetAndNotesMainWindow(QMainWindow):
         self._create_note_marker_fn = create_note_marker_fn
         self._marker_snapshot_fn = marker_snapshot_fn
         self._marker_stream_factory = marker_stream_factory or self._default_marker_stream_factory
+        self._web_note_server_factory = web_note_server_factory or self._default_web_note_server_factory
+        self._web_note_public_host = web_note_public_host or detect_web_note_host()
         self._app_settings_path = Path(app_settings_path) if app_settings_path is not None else default_app_settings_path()
         self._app_settings = self._load_app_settings_fn(self._app_settings_path)
         self._import_dialog_factory = import_dialog_factory
@@ -83,9 +96,17 @@ class SetAndNotesMainWindow(QMainWindow):
         self._install_visual_system()
         self._build_toolbar()
         self._build_central_ui()
+        self._web_note_capture_service = WebNoteCaptureService(
+            project_users=self._current_library().web_note_users,
+            capture_timestamp_fn=self._capture_note_timestamp,
+            create_note_marker_fn=self._create_note_marker_fn,
+        )
+        self._web_note_server = self._web_note_server_factory(self._web_note_capture_service)
+        self._web_note_server.start()
         self.status_panel = StatusPanel(self)
         self.setStatusBar(self.status_panel)
         self._sync_project_fps_combo()
+        self._sync_web_note_users()
 
     def _install_visual_system(self) -> None:
         app = QApplication.instance()
@@ -178,6 +199,9 @@ class SetAndNotesMainWindow(QMainWindow):
             self.main_tabs,
             capture_timestamp_fn=self._capture_note_timestamp,
             create_note_fn=self._create_rehearsal_note,
+            add_web_user_fn=self._add_web_note_user,
+            update_web_user_fn=self._update_web_note_user,
+            copy_all_links_fn=self._copy_all_web_note_links_text,
         )
         self.notes_page.setObjectName("notesPage")
 
@@ -220,6 +244,9 @@ class SetAndNotesMainWindow(QMainWindow):
     ) -> ReaperMarkerStreamClient:
         return ReaperMarkerStreamClient(on_markers=on_markers, on_error=on_error)
 
+    def _default_web_note_server_factory(self, capture_service: object) -> WebNoteServer:
+        return WebNoteServer(capture_service=capture_service)
+
     def _handle_tab_changed(self, index: int) -> None:
         if self.main_tabs.tabText(index) == "Notes":
             if not self._marker_stream_active:
@@ -247,7 +274,8 @@ class SetAndNotesMainWindow(QMainWindow):
 
     def _apply_marker_snapshot(self, markers: list[dict]) -> None:
         grouped = group_notes_by_song(markers)
-        self.notes_page.set_note_sections(build_song_note_sections(grouped))
+        grouped_sections = build_song_note_sections(grouped, fps=float(self._current_library().project_fps or "25"))
+        self.notes_page.set_note_sections(grouped_sections)
         if self.notes_page.status_label.text() == "REAPER marker stream disconnected":
             self.notes_page.status_label.clear()
 
@@ -323,6 +351,9 @@ class SetAndNotesMainWindow(QMainWindow):
         stop = getattr(self._marker_stream, "stop", None)
         if callable(stop):
             stop()
+        server_stop = getattr(self._web_note_server, "stop", None)
+        if callable(server_stop):
+            server_stop()
         super().closeEvent(event)
 
     def _current_library(self) -> Library:
@@ -347,6 +378,7 @@ class SetAndNotesMainWindow(QMainWindow):
         self._save_app_settings_fn(self._app_settings, self._app_settings_path)
 
     def _set_library(self, library: Library, message: str) -> None:
+        library.web_note_users = normalize_web_note_users(library.web_note_users)
         self.song_table.model().set_library(library)
         self._sync_project_fps_combo()
         self.song_table.clearSelection()
@@ -362,6 +394,7 @@ class SetAndNotesMainWindow(QMainWindow):
         self._update_window_title(library)
         self.status_panel.set_project_path(library.library_path)
         self.status_panel.set_message(message)
+        self._sync_web_note_users()
 
     def _sync_project_fps_combo(self) -> None:
         library = self._current_library()
@@ -448,6 +481,7 @@ class SetAndNotesMainWindow(QMainWindow):
         self.status_panel.set_project_path(None)
         self.status_panel.set_message("Project closed")
         self.setWindowTitle("SetAndNotes")
+        self._sync_web_note_users()
 
     def _close_library(self) -> None:
         self._close_project()
@@ -517,6 +551,55 @@ class SetAndNotesMainWindow(QMainWindow):
         if song is None:
             return
         self._open_export_dialog_for_songs([song])
+
+    def _sync_web_note_users(self) -> None:
+        library = self._current_library()
+        self._web_note_capture_service.project_users = library.web_note_users
+        links = {
+            str(user.get("token", "")): build_web_note_url(self._web_note_public_host, self._web_note_server.port, str(user.get("slug", "")))
+            for user in library.web_note_users
+            if user.get("token") and user.get("slug")
+        }
+        self.notes_page.set_web_note_users(library.web_note_users, links)
+
+    def _persist_current_library(self) -> None:
+        library = self._current_library()
+        if not library.library_path:
+            return
+        self._save_library_fn(library, Path(library.library_path))
+
+    def _add_web_note_user(self, username: str) -> None:
+        if not username.strip():
+            return
+        library = self._current_library()
+        library.web_note_users.append(
+            create_web_note_user(
+                username,
+                existing_slugs={str(user.get("slug", "")).strip() for user in library.web_note_users},
+            )
+        )
+        self._persist_current_library()
+        self._sync_web_note_users()
+
+    def _update_web_note_user(self, token: str, username: str, enabled: bool) -> None:
+        library = self._current_library()
+        for user in library.web_note_users:
+            if user.get("token") != token:
+                continue
+            user["username"] = username.strip()
+            user["slug"] = ""
+            user["enabled"] = bool(enabled)
+            library.web_note_users = normalize_web_note_users(library.web_note_users)
+            self._persist_current_library()
+            self._sync_web_note_users()
+            return
+
+    def _copy_all_web_note_links_text(self) -> str:
+        return build_copy_all_web_note_links_text(
+            self._current_library().web_note_users,
+            host=self._web_note_public_host,
+            port=self._web_note_server.port,
+        )
 
     def handle_import_result(self, result) -> None:
         message = f"Imported {result.imported_files} files"

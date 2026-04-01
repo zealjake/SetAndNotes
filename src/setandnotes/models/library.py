@@ -12,6 +12,7 @@ class Library:
     project_fps: str = "25"
     songs: list[Song] = field(default_factory=list)
     touchdesigner_sessions: list[dict[str, Any]] = field(default_factory=list)
+    web_note_users: list[dict[str, Any]] = field(default_factory=list)
     library_path: str | None = None
 
     def add_song(self, song: Song) -> "Library":
@@ -45,6 +46,7 @@ class Library:
             "project_fps": self.project_fps,
             "songs": [song.to_dict() for song in self.songs],
             "touchdesigner_sessions": list(self.touchdesigner_sessions),
+            "web_note_users": [dict(user) for user in self.web_note_users],
             "library_path": self.library_path,
         }
 
@@ -57,6 +59,7 @@ class Library:
         )
         library.songs = [Song.from_dict(song) for song in payload.get("songs", [])]
         library.touchdesigner_sessions = [dict(session) for session in payload.get("touchdesigner_sessions", [])]
+        library.web_note_users = [dict(user) for user in payload.get("web_note_users", [])]
         if "project_fps" not in payload:
             derived_project_fps = None
             for song in library.songs:
