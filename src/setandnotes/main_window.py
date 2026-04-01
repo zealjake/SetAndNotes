@@ -3,22 +3,31 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtCore import QObject, QItemSelectionModel, Qt, Signal
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QWidget, QSplitter, QToolBar
+from PySide6.QtWidgets import QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QWidget, QSplitter, QToolBar, QVBoxLayout, QTabWidget
 
 from setandnotes.models.library import Library
+from setandnotes.models.rehearsal_notes import build_song_note_sections
 from setandnotes.services.app_settings import default_app_settings_path, load_app_settings, save_app_settings
 from setandnotes.services.persistence import load_library, save_library
+from setandnotes.services.reaper_marker_stream import ReaperMarkerStreamClient
+from setandnotes.services.reaper_notes import capture_note_timestamp, create_note_marker, fetch_marker_snapshot, group_notes_by_song
 from setandnotes.services.touchdesigner_render_import import import_rendered_video_folder
 from setandnotes.styles.fonts import activate_application_fonts
 from setandnotes.styles.theme import application_stylesheet
 from setandnotes.ui.export_dialog import ExportDialog
 from setandnotes.ui.import_dialog import ImportDialog
 from setandnotes.ui.detail_panel import DetailPanel
+from setandnotes.ui.notes_page import NotesPage
 from setandnotes.ui.song_table import SongTable
 from setandnotes.ui.status_bar import StatusPanel
 from setandnotes.workers.import_worker import run_import_job
+
+
+class _MarkerStreamBridge(QObject):
+    markersReceived = Signal(list)
+    errorReceived = Signal(str)
 
 
 class SetAndNotesMainWindow(QMainWindow):
@@ -35,6 +44,10 @@ class SetAndNotesMainWindow(QMainWindow):
         save_library_fn=save_library,
         load_app_settings_fn=load_app_settings,
         save_app_settings_fn=save_app_settings,
+        capture_note_timestamp_fn=capture_note_timestamp,
+        create_note_marker_fn=create_note_marker,
+        marker_snapshot_fn=fetch_marker_snapshot,
+        marker_stream_factory: Callable[[Callable[[list[dict]], None], Callable[[str], None]], object] | None = None,
         app_settings_path: Path | str | None = None,
         import_dialog_factory=ImportDialog,
         export_dialog_factory=ExportDialog,
@@ -51,10 +64,22 @@ class SetAndNotesMainWindow(QMainWindow):
         self._save_library_fn = save_library_fn
         self._load_app_settings_fn = load_app_settings_fn
         self._save_app_settings_fn = save_app_settings_fn
+        self._capture_note_timestamp_fn = capture_note_timestamp_fn
+        self._create_note_marker_fn = create_note_marker_fn
+        self._marker_snapshot_fn = marker_snapshot_fn
+        self._marker_stream_factory = marker_stream_factory or self._default_marker_stream_factory
         self._app_settings_path = Path(app_settings_path) if app_settings_path is not None else default_app_settings_path()
         self._app_settings = self._load_app_settings_fn(self._app_settings_path)
         self._import_dialog_factory = import_dialog_factory
         self._export_dialog_factory = export_dialog_factory
+        self._marker_stream_bridge = _MarkerStreamBridge(self)
+        self._marker_stream_bridge.markersReceived.connect(self._apply_marker_snapshot)
+        self._marker_stream_bridge.errorReceived.connect(self._handle_marker_stream_error)
+        self._marker_stream = self._marker_stream_factory(
+            self._marker_stream_bridge.markersReceived.emit,
+            self._marker_stream_bridge.errorReceived.emit,
+        )
+        self._marker_stream_active = False
         self._install_visual_system()
         self._build_toolbar()
         self._build_central_ui()
@@ -127,9 +152,18 @@ class SetAndNotesMainWindow(QMainWindow):
 
     def _build_central_ui(self) -> None:
         root = QWidget(self)
-        layout = QHBoxLayout(root)
+        layout = QVBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
+
+        self.main_tabs = QTabWidget(root)
+        self.main_tabs.setObjectName("mainTabs")
+        self.main_tabs.currentChanged.connect(self._handle_tab_changed)
+
+        setlist_page = QWidget(self.main_tabs)
+        setlist_layout = QHBoxLayout(setlist_page)
+        setlist_layout.setContentsMargins(0, 0, 0, 0)
+        setlist_layout.setSpacing(12)
 
         splitter = QSplitter(Qt.Horizontal, root)
         self.song_table = SongTable(splitter)
@@ -138,8 +172,18 @@ class SetAndNotesMainWindow(QMainWindow):
         splitter.addWidget(self.detail_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        setlist_layout.addWidget(splitter)
 
-        layout.addWidget(splitter)
+        self.notes_page = NotesPage(
+            self.main_tabs,
+            capture_timestamp_fn=self._capture_note_timestamp,
+            create_note_fn=self._create_rehearsal_note,
+        )
+        self.notes_page.setObjectName("notesPage")
+
+        self.main_tabs.addTab(setlist_page, "Setlist")
+        self.main_tabs.addTab(self.notes_page, "Notes")
+        layout.addWidget(self.main_tabs)
         self.setCentralWidget(root)
         self.song_table.selectionModel().selectionChanged.connect(self._sync_detail_panel)
         self.detail_panel.songUpdated.connect(self._refresh_song_row)
@@ -168,6 +212,47 @@ class SetAndNotesMainWindow(QMainWindow):
         connect = getattr(signal, "connect", None)
         if connect is not None:
             connect(handler)
+
+    def _default_marker_stream_factory(
+        self,
+        on_markers: Callable[[list[dict]], None],
+        on_error: Callable[[str], None],
+    ) -> ReaperMarkerStreamClient:
+        return ReaperMarkerStreamClient(on_markers=on_markers, on_error=on_error)
+
+    def _handle_tab_changed(self, index: int) -> None:
+        if self.main_tabs.tabText(index) == "Notes":
+            if not self._marker_stream_active:
+                self._marker_stream.start()
+                self._marker_stream_active = True
+            return
+
+        if self._marker_stream_active:
+            stop = getattr(self._marker_stream, "stop", None)
+            if callable(stop):
+                stop()
+            self._marker_stream_active = False
+
+    def _capture_note_timestamp(self) -> float:
+        return self._capture_note_timestamp_fn()
+
+    def _create_rehearsal_note(self, username: str, note_type: str, body: str, timestamp: float) -> dict:
+        result = self._create_note_marker_fn(username, note_type, body, timestamp)
+        try:
+            markers = self._marker_snapshot_fn()
+        except Exception:
+            return result
+        self._apply_marker_snapshot(markers)
+        return result
+
+    def _apply_marker_snapshot(self, markers: list[dict]) -> None:
+        grouped = group_notes_by_song(markers)
+        self.notes_page.set_note_sections(build_song_note_sections(grouped))
+        if self.notes_page.status_label.text() == "REAPER marker stream disconnected":
+            self.notes_page.status_label.clear()
+
+    def _handle_marker_stream_error(self, message: str) -> None:
+        self.notes_page.status_label.setText(message)
 
     def _pick_open_project_path(self) -> str | None:
         path, _ = QFileDialog.getOpenFileName(
@@ -233,6 +318,12 @@ class SetAndNotesMainWindow(QMainWindow):
         if library.library_path:
             return Path(library.library_path).parent
         return Path.cwd()
+
+    def closeEvent(self, event) -> None:
+        stop = getattr(self._marker_stream, "stop", None)
+        if callable(stop):
+            stop()
+        super().closeEvent(event)
 
     def _current_library(self) -> Library:
         return self.song_table.model().library()
