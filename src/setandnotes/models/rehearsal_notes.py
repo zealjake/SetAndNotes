@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class RehearsalNote:
     guid: str
     time_text: str
+    song_time_text: str
     username: str
     note_type: str
     body: str
@@ -19,13 +20,15 @@ class SongNoteSection:
     notes: list[RehearsalNote]
 
 
-def build_song_note_sections(grouped_notes: list[dict]) -> list[SongNoteSection]:
+def build_song_note_sections(grouped_notes: list[dict], *, fps: float = 25.0) -> list[SongNoteSection]:
     sections: list[SongNoteSection] = []
     for group in grouped_notes:
+        song_marker_pos_sec = float(group.get("song_marker_pos_sec", 0.0) or 0.0)
         notes = [
             RehearsalNote(
                 guid=str(note.get("guid", "")),
                 time_text=format_note_time(float(note.get("pos_sec", 0.0) or 0.0)),
+                song_time_text=format_note_timecode(max(0.0, float(note.get("pos_sec", 0.0) or 0.0) - song_marker_pos_sec), fps),
                 username=str(note.get("username", "")),
                 note_type=str(note.get("note_type", "")),
                 body=str(note.get("body", "")),
@@ -48,3 +51,15 @@ def format_note_time(pos_sec: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     seconds, millis = divmod(remainder, 1_000)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def format_note_timecode(pos_sec: float, fps: float) -> str:
+    fps_value = max(1, int(round(fps)))
+    total_frames = max(0, int(round(pos_sec * fps_value)))
+    frames = total_frames % fps_value
+    total_seconds = total_frames // fps_value
+    seconds = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"

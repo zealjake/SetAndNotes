@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QAbstractItemView, QComboBox, QHeaderView, QMainWindow, QTableView, QWidget, QToolBar, QTabWidget
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QCheckBox, QComboBox, QHeaderView, QLineEdit, QMainWindow, QPushButton, QTableView, QWidget, QToolBar, QTabWidget
 
 
 def _app() -> QApplication:
@@ -84,7 +85,8 @@ def test_main_window_groups_note_markers_under_nearest_preceding_song_marker():
     song_item = window.notes_page.notes_tree.topLevelItem(0)
     assert song_item.text(0) == "Intro Song"
     assert song_item.childCount() == 1
-    assert song_item.child(0).text(1) == "Jake"
+    assert song_item.child(0).text(1) == "00:00:02:12"
+    assert song_item.child(0).text(2) == "Jake"
 
 
 def test_main_window_starts_marker_stream_only_when_notes_tab_is_active():
@@ -141,6 +143,74 @@ def test_main_window_clears_stale_stream_error_after_marker_snapshot():
     )
 
     assert window.notes_page.status_label.text() == ""
+
+
+def test_main_window_renders_project_web_note_links_and_persists_new_users(tmp_path: Path):
+    _app()
+
+    from setandnotes.main_window import SetAndNotesMainWindow
+    from setandnotes.models.library import Library
+
+    class FakeMarkerStream:
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class FakeWebServer:
+        def __init__(self) -> None:
+            self.port = 8787
+            self.started = 0
+            self.stopped = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+    saved: list[tuple[str, list[dict[str, object]]]] = []
+    fake_server = FakeWebServer()
+
+    def _save_library(library, path) -> None:
+        saved.append((str(path), [dict(user) for user in library.web_note_users]))
+
+    window = SetAndNotesMainWindow(
+        marker_stream_factory=lambda on_markers, on_error: FakeMarkerStream(),
+        save_library_fn=_save_library,
+        web_note_server_factory=lambda capture_service: fake_server,
+        web_note_public_host="192.168.1.50",
+    )
+
+    library = Library(
+        project_name="Tour",
+        library_path=str(tmp_path / "tour.zeal"),
+        web_note_users=[{"username": "CreativeDirector", "token": "tok-creative", "slug": "creative-director", "enabled": True}],
+    )
+    window._set_library(library, "Loaded")
+
+    assert fake_server.started == 1
+    assert window.notes_page.web_users_tree.topLevelItemCount() == 1
+    item = window.notes_page.web_users_tree.topLevelItem(0)
+    username_input = window.notes_page.web_users_tree.itemWidget(item, 0)
+    enabled_checkbox = window.notes_page.web_users_tree.itemWidget(item, 1)
+    link_input = window.notes_page.web_users_tree.itemWidget(item, 2)
+    copy_button = window.notes_page.web_users_tree.itemWidget(item, 3)
+    assert isinstance(username_input, QLineEdit)
+    assert isinstance(enabled_checkbox, QCheckBox)
+    assert isinstance(link_input, QLineEdit)
+    assert isinstance(copy_button, QPushButton)
+    assert username_input.text() == "CreativeDirector"
+    assert link_input.text() == "http://192.168.1.50:8787/notes/u/creative-director"
+
+    window.notes_page.web_user_name_input.setText("VideoDirector")
+    window.notes_page.add_web_user_button.click()
+
+    assert len(window._current_library().web_note_users) == 2
+    assert window._current_library().web_note_users[1]["username"] == "VideoDirector"
+    assert saved[-1][0].endswith("tour.zeal")
+    assert saved[-1][1][1]["username"] == "VideoDirector"
 
 
 def test_theme_and_font_hooks_exist():

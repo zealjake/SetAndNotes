@@ -4,7 +4,9 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtCore import QMimeData
+from PySide6.QtWidgets import QApplication, QCheckBox, QLineEdit, QPushButton
 
 from setandnotes.models.rehearsal_notes import RehearsalNote, SongNoteSection
 
@@ -92,6 +94,7 @@ def test_notes_page_renders_grouped_song_headers_and_notes():
                     RehearsalNote(
                         guid="note-1",
                         time_text="00:01:07.125",
+                        song_time_text="00:00:07:03",
                         username="Jake",
                         note_type="Cameras",
                         body="Push in too slow",
@@ -106,6 +109,74 @@ def test_notes_page_renders_grouped_song_headers_and_notes():
     assert song_item.text(0) == "Intro Song"
     assert song_item.childCount() == 1
     assert song_item.child(0).text(0) == "00:01:07.125"
-    assert song_item.child(0).text(1) == "Jake"
-    assert song_item.child(0).text(2) == "Cameras"
-    assert song_item.child(0).text(3) == "Push in too slow"
+    assert song_item.child(0).text(1) == "00:00:07:03"
+    assert song_item.child(0).text(2) == "Jake"
+    assert song_item.child(0).text(3) == "Cameras"
+    assert song_item.child(0).text(4) == "Push in too slow"
+
+
+def test_notes_page_adds_and_edits_project_web_note_users():
+    _app()
+
+    added: list[str] = []
+    updated: list[tuple[str, str, bool]] = []
+
+    from setandnotes.ui.notes_page import NotesPage
+
+    page = NotesPage(
+        add_web_user_fn=lambda username: added.append(username),
+        update_web_user_fn=lambda token, username, enabled: updated.append((token, username, enabled)),
+    )
+
+    page.web_user_name_input.setText("CreativeDirector")
+    page.add_web_user_button.click()
+
+    assert added == ["CreativeDirector"]
+    assert page.web_user_name_input.text() == ""
+
+    page.set_web_note_users(
+        [{"username": "CreativeDirector", "token": "tok-creative", "slug": "creative-director", "enabled": True}],
+        {"tok-creative": "http://192.168.1.50:8787/notes/u/creative-director"},
+    )
+
+    assert page.web_users_tree.topLevelItemCount() == 1
+    item = page.web_users_tree.topLevelItem(0)
+    username_input = page.web_users_tree.itemWidget(item, 0)
+    enabled_checkbox = page.web_users_tree.itemWidget(item, 1)
+    link_input = page.web_users_tree.itemWidget(item, 2)
+    copy_button = page.web_users_tree.itemWidget(item, 3)
+
+    assert isinstance(username_input, QLineEdit)
+    assert isinstance(enabled_checkbox, QCheckBox)
+    assert isinstance(link_input, QLineEdit)
+    assert isinstance(copy_button, QPushButton)
+    assert username_input.text() == "CreativeDirector"
+    assert link_input.text() == "http://192.168.1.50:8787/notes/u/creative-director"
+    assert link_input.isReadOnly()
+
+    username_input.setText("CreativeLead")
+    username_input.editingFinished.emit()
+    assert updated[-1] == ("tok-creative", "CreativeLead", True)
+
+    enabled_checkbox.setChecked(False)
+    assert updated[-1] == ("tok-creative", "CreativeLead", False)
+
+    QApplication.clipboard().clear()
+    copy_button.click()
+    assert QApplication.clipboard().text() == "http://192.168.1.50:8787/notes/u/creative-director"
+
+
+def test_notes_page_can_copy_all_links_as_message():
+    _app()
+
+    copied: list[str] = []
+
+    from setandnotes.ui.notes_page import NotesPage
+
+    page = NotesPage(copy_all_links_fn=lambda: "USER 1 : http://host/one\nUSER 2 : http://host/two")
+    page.copy_all_web_users_button.click()
+
+    mime = QApplication.clipboard().mimeData()
+    assert QApplication.clipboard().text() == "USER 1 : http://host/one\nUSER 2 : http://host/two"
+    assert mime is not None
+    assert mime.hasHtml()

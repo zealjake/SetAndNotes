@@ -82,6 +82,7 @@ def group_notes_by_song(markers: list[dict]) -> list[dict]:
             current_group = {
                 "song_name": marker.get("name", ""),
                 "song_marker_guid": marker.get("guid", ""),
+                "song_marker_pos_sec": float(marker.get("pos_sec", 0.0) or 0.0),
                 "notes": [],
             }
             grouped.append(current_group)

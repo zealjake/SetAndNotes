@@ -69,8 +69,8 @@ def test_group_notes_by_song_ignores_default_markers_as_notes() -> None:
     grouped = group_notes_by_song(markers)
 
     assert grouped == [
-        {"song_name": "Song A", "song_marker_guid": "song-1", "notes": []},
-        {"song_name": "Song B", "song_marker_guid": "song-2", "notes": []},
+        {"song_name": "Song A", "song_marker_guid": "song-1", "song_marker_pos_sec": 1.0, "notes": []},
+        {"song_name": "Song B", "song_marker_guid": "song-2", "song_marker_pos_sec": 2.0, "notes": []},
     ]
 
 
